@@ -2,6 +2,13 @@ name: Build and deploy Aseprite
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Force build even if cached"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
   schedule:
     - cron: '0 0 * * *' # 每天 00:00 UTC
   push:
@@ -23,7 +30,8 @@ jobs:
       latest_tag: ${{ steps.version_info.outputs.latest_tag }}
       source_url: ${{ steps.version_info.outputs.source_url }}
       version_body: ${{ steps.version_info.outputs.version_body }}
-      should_build: ${{ steps.should_build.outputs.should_build }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+      skip_reason: ${{ steps.decide.outputs.skip_reason }}
     steps:
       - name: Get latest version info
         id: version_info
@@ -45,22 +53,54 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Load version from cache
-        id: version_check
+      - name: Load version cache
+        id: version_cache
         uses: actions/cache@v3
         with:
           path: ${{ steps.version_info.outputs.latest_tag }}.txt
           key: cached_version-${{ steps.version_info.outputs.latest_tag }}
 
-      - name: Should we start new build?
-        id: should_build
-        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/fix' || steps.version_check.outputs.cache-hit != 'true'
-        run: echo "should_build=true" >> $GITHUB_OUTPUT
+      # 统一“是否构建”的决策，并产出可读的原因
+      - name: Decide whether to build
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHOULD="false"
+          REASON=""
+
+          FORCE="${{ github.event_name == 'workflow_dispatch' && inputs.force == 'true' }}"
+          ON_FIX="${{ github.ref == 'refs/heads/fix' }}"
+          CACHE_HIT="${{ steps.version_cache.outputs.cache-hit == 'true' }}"
+
+          if [ "$FORCE" = "true" ]; then
+            SHOULD="true"
+            REASON="Force build via workflow_dispatch.input.force == true"
+          elif [ "$ON_FIX" = "true" ]; then
+            SHOULD="true"
+            REASON="Branch is 'fix'"
+          elif [ "$CACHE_HIT" = "true" ]; then
+            SHOULD="false"
+            REASON="Latest tag '${{ steps.version_info.outputs.latest_tag }}' already cached; no new upstream release"
+          else
+            SHOULD="true"
+            REASON="Cache miss for latest tag '${{ steps.version_info.outputs.latest_tag }}'"
+          fi
+
+          echo "should_build=${SHOULD}" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${REASON}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Build decision"
+            echo "- should_build: **$SHOULD**"
+            echo "- reason: $REASON"
+            echo "- latest_tag: \`${{ steps.version_info.outputs.latest_tag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build-aseprite:
     name: Build Aseprite (Windows)
     needs: check-version
-    if: ${{ needs.check-version.outputs.should_build }}
+    if: ${{ needs.check-version.outputs.should_build == 'true' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,13 +117,13 @@ jobs:
         run: |
           if (Test-Path "C:\Program Files\OpenSSL\") { Remove-Item -Recurse -Force "C:\Program Files\OpenSSL\" }
 
-      # ---- Skia 缓存与下载（固定为 m124，如需换版本改 key 与下载 URL）----
+      # ---- Skia 缓存与下载（固定 m124；升级换 key 与 URL）----
       - name: Cache Skia
         id: skia-cache
         uses: actions/cache@v3
         with:
           path: skia
-          key: skia-${{ runner.os }}-m124
+          key: skia-${{ runner.os }}-m124-08a5439a6b
 
       - name: Download Skia (when not cached)
         if: steps.skia-cache.outputs.cache-hit != 'true'
@@ -93,16 +133,16 @@ jobs:
           curl.exe -L -o Skia-${{ runner.os }}-Release-x64.zip $url
           7z x Skia-${{ runner.os }}-Release-x64.zip -oskia
 
-      # ---- 关键修复：用绝对路径写入 $GITHUB_ENV，避免 Convert-Path 相对路径问题 ----
+      # ---- 关键：用绝对路径写入 $GITHUB_ENV，避免 Convert-Path 相对路径问题 ----
       - name: Set SKIA env paths
         shell: pwsh
         run: |
           $skiaDir = Join-Path "${{ github.workspace }}" "skia"
           $skiaLibDir = Join-Path $skiaDir "out/Release-x64"
           $skiaLib = Join-Path $skiaLibDir "skia.lib"
-          "SKIA_DIR=$skiaDir"     | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SKIA_DIR=$skiaDir"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SKIA_LIB_DIR=$skiaLibDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SKIA_LIB=$skiaLib"     | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SKIA_LIB=$skiaLib"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # ---- 下载 Aseprite 源码并确定源码根目录（zipball 顶层目录随机）----
       - name: Download Aseprite source
@@ -116,7 +156,7 @@ jobs:
           "ASPR_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           mkdir "$root/build"
 
-      # ---- 设置 VS 编译环境（跨步可用）----
+      # ---- 设置 VS 编译环境（跨步骤可用）----
       - name: Setup VS Dev Env (x64)
         uses: seanmiddleditch/gha-setup-vsdevenv@v4
         with:
@@ -173,9 +213,9 @@ jobs:
 
   release:
     name: Publish Release
-    needs: [check-version, build-aseprite]
+    needs: check-version
+    if: ${{ needs.check-version.outputs.should_build == 'true' }}
     runs-on: ubuntu-latest
-    if: ${{ needs.check-version.outputs.should_build }}
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
