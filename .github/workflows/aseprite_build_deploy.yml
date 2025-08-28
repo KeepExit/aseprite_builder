@@ -32,8 +32,7 @@ jobs:
           set -euo pipefail
           data="$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)"
           LATEST_TAG="$(echo "$data" | jq -r '.tag_name')"
-          # 拿源码 zip（zipball_url），避免抓到一堆资产 URL
-          SOURCE_URL="$(echo "$data" | jq -r '.zipball_url')"
+          SOURCE_URL="$(echo "$data" | jq -r '.zipball_url')"  # 只取源码 zip
           VERSION_BODY="$(echo "$data" | jq -r '.body')"
 
           echo "${LATEST_TAG}" > "${LATEST_TAG}.txt"
@@ -66,34 +65,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure 7-Zip (Windows)
+      - name: Ensure 7-Zip
         shell: pwsh
         run: choco install 7zip -y
 
-      - name: Install Ninja (Windows)
+      - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v3
 
-      - name: Remove OpenSSL from PATH (Windows)
+      - name: Remove OpenSSL from PATH (optional)
         shell: pwsh
         run: |
           if (Test-Path "C:\Program Files\OpenSSL\") { Remove-Item -Recurse -Force "C:\Program Files\OpenSSL\" }
 
+      # ---- Skia 缓存与下载（固定为 m124，如需换版本改 key 与下载 URL）----
       - name: Cache Skia
         id: skia-cache
         uses: actions/cache@v3
         with:
           path: skia
-          # 如需切换 Skia 版本，改这里的 key 即可
           key: skia-${{ runner.os }}-m124
 
-      - name: Download Skia if not in cache
+      - name: Download Skia (when not cached)
         if: steps.skia-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $url = "https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-${{ runner.os }}-Release-x64.zip"
-          curl.exe -L -o Skia-${{ runner.os }}-Release-X64.zip $url
-          7z x Skia-${{ runner.os }}-Release-X64.zip -oskia
+          curl.exe -L -o Skia-${{ runner.os }}-Release-x64.zip $url
+          7z x Skia-${{ runner.os }}-Release-x64.zip -oskia
 
+      # ---- 关键修复：用绝对路径写入 $GITHUB_ENV，避免 Convert-Path 相对路径问题 ----
+      - name: Set SKIA env paths
+        shell: pwsh
+        run: |
+          $skiaDir = Join-Path "${{ github.workspace }}" "skia"
+          $skiaLibDir = Join-Path $skiaDir "out/Release-x64"
+          $skiaLib = Join-Path $skiaLibDir "skia.lib"
+          "SKIA_DIR=$skiaDir"     | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SKIA_LIB_DIR=$skiaLibDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SKIA_LIB=$skiaLib"     | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # ---- 下载 Aseprite 源码并确定源码根目录（zipball 顶层目录随机）----
       - name: Download Aseprite source
         shell: pwsh
         run: |
@@ -101,16 +112,17 @@ jobs:
           curl.exe -L -o Aseprite-source.zip $src
           mkdir aseprite
           7z x Aseprite-source.zip -oaseprite
-          # zipball 解压后会是未知目录名，取第一层目录为源码根
           $root = (Get-ChildItem aseprite | Where-Object { $_.PSIsContainer } | Select-Object -First 1).FullName
-          echo "ASPR_ROOT=$root" >> $env:GITHUB_ENV
+          "ASPR_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           mkdir "$root/build"
 
+      # ---- 设置 VS 编译环境（跨步可用）----
       - name: Setup VS Dev Env (x64)
-        # 配置 VS 构建环境变量
-        shell: cmd
-        run: call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+        uses: seanmiddleditch/gha-setup-vsdevenv@v4
+        with:
+          arch: x64
 
+      # ---- CMake & Ninja 构建（使用绝对路径 env）----
       - name: Run CMake (Windows)
         shell: pwsh
         working-directory: ${{ env.ASPR_ROOT }}/build
@@ -119,9 +131,9 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           -DCMAKE_IGNORE_PATH='C:/ProgramData/chocolatey/bin/;C:/Strawberry/c/bin/'
           -DLAF_BACKEND=skia
-          -DSKIA_DIR="$(Convert-Path ../../skia)"
-          -DSKIA_LIBRARY_DIR="$(Convert-Path ../../skia/out/Release-x64)"
-          -DSKIA_LIBRARY="$(Convert-Path ../../skia/out/Release-x64/skia.lib)"
+          -DSKIA_DIR="${{ env.SKIA_DIR }}"
+          -DSKIA_LIBRARY_DIR="${{ env.SKIA_LIB_DIR }}"
+          -DSKIA_LIBRARY="${{ env.SKIA_LIB }}"
           -G Ninja
           ..
 
@@ -136,7 +148,7 @@ jobs:
         run: |
           ' # This file is here so Aseprite behaves as a portable program' | Out-File -Encoding ascii -NoNewline aseprite.ini
 
-      - name: Clean up temp binaries
+      - name: Clean temp tools
         shell: bash
         working-directory: ${{ env.ASPR_ROOT }}/build/bin
         run: rm -f gen modp_b64_gen gen.exe gen.exe.manifest modp_b64_gen.exe modp_b64_gen.exe.manifest
