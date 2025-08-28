@@ -213,16 +213,17 @@ jobs:
 
   release:
     name: Publish Release
-    needs: check-version
-    if: ${{ needs.check-version.outputs.should_build == 'true' }}
+    needs: [check-version, build-aseprite]
+    if: ${{ needs.check-version.outputs.should_build == 'true' && needs.build-aseprite.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: Aseprite-${{ needs.check-version.outputs.latest_tag }}-Windows
+          pattern: Aseprite-${{ needs.check-version.outputs.latest_tag }}-Windows*
           path: dist
-
+          merge-multiple: true
+  
       - name: Create/Update GitHub Release and upload asset
         uses: softprops/action-gh-release@v2
         with:
